@@ -157,10 +157,9 @@ class StorageManager:
             json.dump(all_data, f, ensure_ascii=False, indent=4)
 
 # ==========================================
-# 3. 邏輯層 (Controller)
+# 3. 邏輯層 (Controller) - 📌 新增強大選牌演算法
 # ==========================================
 class BingoGameLogic:
-    # 📌 100% 精準校正：2026 台彩官方 1~6 星限時加碼金額表
     PRIZE_TABLE = {
         10: {10: 5000000, 9: 250000, 8: 25000, 7: 2500, 6: 250, 5: 25, 0: 25},
         9: {9: 1000000, 8: 100000, 7: 3000, 6: 500, 5: 100, 4: 25, 0: 25},
@@ -193,6 +192,23 @@ class BingoGameLogic:
         return sorted(random.sample(pool, star))
 
     @staticmethod
+    def gen_drag(history: List[Dict], star: int) -> List[int]:
+        """📌 新增：拖牌快選演算法"""
+        if len(history) < 2: return sorted(random.sample(range(1, 81), star))
+        last_draw = history[0]['numbers']
+        associated_nums = []
+        # 尋找最近 50 期內，開出上一期號碼時，伴隨開出的號碼
+        for draw in history[1:51]:
+            shared = set(last_draw) & set(draw['numbers'])
+            if shared:
+                associated_nums.extend([n for n in draw['numbers'] if n not in last_draw])
+        if not associated_nums: return sorted(random.sample(range(1, 81), star))
+        
+        counter = Counter(associated_nums)
+        top_drag = [num for num, _ in counter.most_common(max(15, star))]
+        return sorted(random.sample(top_drag, star))
+
+    @staticmethod
     def gen_repeat(history: List[Dict], star: int) -> List[int]:
         if not history: return sorted(random.sample(range(1, 81), star))
         return sorted(random.sample(history[0]['numbers'], min(star, len(history[0]['numbers']))))
@@ -213,10 +229,25 @@ class BingoGameLogic:
         return sorted(random.sample(pool, star))
 
     @staticmethod
-    def fill_remaining(picks: List[int], star: int) -> List[int]:
+    def fill_remaining_rand(picks: List[int], star: int) -> List[int]:
         picks = picks[:star]
         if len(picks) >= star: return sorted(picks)
         return sorted(picks + random.sample(list(set(range(1, 81)) - set(picks)), star - len(picks)))
+
+    @staticmethod
+    def fill_remaining_hot(picks: List[int], star: int, history: List[Dict]) -> List[int]:
+        """📌 新增：智慧熱門號碼補滿"""
+        picks = picks[:star]
+        if len(picks) >= star: return sorted(picks)
+        
+        freq = BingoGameLogic.get_frequencies(history)
+        hot_nums = [i[0] for i in freq.most_common()]
+        available_hot = [n for n in hot_nums if n not in picks]
+        
+        needed = star - len(picks)
+        pool_size = max(needed + 5, 10) # 從前段班挑選，保留一點隨機性
+        chosen = random.sample(available_hot[:pool_size], needed)
+        return sorted(picks + chosen)
 
 # ==========================================
 # 4. 視覺層 (View)
@@ -238,8 +269,6 @@ class BingoUI:
             .time-tag { color: #666; font-size: 0.85em; margin-left: 10px; background: #eee; padding: 2px 8px; border-radius: 12px; }
             .bonus-tag { background: linear-gradient(90deg, #ff416c, #ff4b2b); color: white; padding: 4px 12px; border-radius: 15px; font-weight: bold; margin-bottom: 10px; display: inline-block; }
             .assoc-box { background-color: #f8f9fa; padding: 15px; border-radius: 10px; margin-bottom: 10px; border-left: 5px solid #007AFF;}
-            .type-tag-real { background-color: #34C759; color: white; padding: 2px 8px; border-radius: 10px; font-size: 0.8em; }
-            .type-tag-virtual { background-color: #007AFF; color: white; padding: 2px 8px; border-radius: 10px; font-size: 0.8em; }
         </style>
         """, unsafe_allow_html=True)
 
@@ -295,9 +324,6 @@ def main():
                     c1.markdown(f"**第 `{draw['issue']}` 期**<br><span class='time-tag'>🕒 {draw['time']}</span>", unsafe_allow_html=True)
                     c2.markdown(BingoUI.render_balls(draw['numbers'], "normal") + BingoUI.render_balls(draw['super_num'], "super"), unsafe_allow_html=True)
 
-    # ==========================
-    # 🔥 Tab 2: 深度盤勢分析 (新增 Top 15)
-    # ==========================
     with tab2:
         st.subheader("📊 今日專屬實戰盤勢分析")
         today_str = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
@@ -313,15 +339,9 @@ def main():
         if today_data:
             counter = BingoGameLogic.get_frequencies(today_data)
             
-            # --- 1. 完整 80 號極端冷熱門排行榜 (Top 15) 📌 新增 ---
             st.markdown("### 🏆 今日極端冷熱門排行榜 (Top 15)")
-            
-            # 建立包含 1~80 號完整資料的字典 (沒開出的補 0)
             full_counts = {i: counter.get(i, 0) for i in range(1, 81)}
-            
-            # 熱門排序 (次數由多到少 -> 次數相同則號碼由小到大)
             sorted_hot = sorted(full_counts.items(), key=lambda x: (-x[1], x[0]))[:15]
-            # 冷門排序 (次數由少到多 -> 次數相同則號碼由小到大)
             sorted_cold = sorted(full_counts.items(), key=lambda x: (x[1], x[0]))[:15]
 
             col_hot, col_cold = st.columns(2)
@@ -329,19 +349,18 @@ def main():
                 st.markdown("##### 🔥 最常出現 15 名")
                 df_hot = pd.DataFrame(sorted_hot, columns=["號碼", "出現次數"])
                 df_hot["號碼"] = df_hot["號碼"].apply(lambda x: f"🔥 {x:02d}")
-                df_hot.index = range(1, 16) # 讓 Index 從 1 開始
+                df_hot.index = range(1, 16) 
                 st.dataframe(df_hot, use_container_width=True)
             
             with col_cold:
                 st.markdown("##### ❄️ 最少出現 15 名")
                 df_cold = pd.DataFrame(sorted_cold, columns=["號碼", "出現次數"])
                 df_cold["號碼"] = df_cold["號碼"].apply(lambda x: f"❄️ {x:02d}")
-                df_cold.index = range(1, 16) # 讓 Index 從 1 開始
+                df_cold.index = range(1, 16) 
                 st.dataframe(df_cold, use_container_width=True)
             
             st.divider()
 
-            # --- 2. 區間熱力分佈 ---
             st.markdown("### 🌡️ 號碼區間熱度分佈")
             zones = {f"{i*10+1:02d}-{i*10+10:02d}": 0 for i in range(8)}
             for num, cnt in counter.items():
@@ -354,7 +373,6 @@ def main():
             st.caption(f"💡 目前最燙手的板塊為 **「{hottest_zone}」** 區間，喜歡包牌的玩家可鎖定此範圍。")
             st.divider()
 
-            # --- 3. 焦點熱門號 & 共伴拖牌效應 ---
             st.markdown("### 🎯 焦點霸主 & 共伴拖牌效應")
             top_hot_5 = counter.most_common(5)
             for hot_num, count in top_hot_5:
@@ -373,15 +391,11 @@ def main():
                     """, unsafe_allow_html=True)
             st.divider()
 
-            # --- 4. 極端遺漏值追蹤 (冷牌回補) ---
             st.markdown("### 🥶 極端冷牌追蹤 (最大遺漏期數)")
-            st.markdown("尋找已經非常久沒開出來的號碼，適合喜歡等「觸底反彈」的冷牌策略玩家。")
-            
             last_seen = {i: -1 for i in range(1, 81)}
             for current_idx, draw in enumerate(today_data):
                 for num in draw['numbers']:
-                    if last_seen[num] == -1:
-                        last_seen[num] = current_idx
+                    if last_seen[num] == -1: last_seen[num] = current_idx
             
             missing_counts = {num: (idx if idx != -1 else len(today_data)) for num, idx in last_seen.items()}
             top_missing = sorted(missing_counts.items(), key=lambda x: x[1], reverse=True)[:5]
@@ -389,13 +403,10 @@ def main():
             col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
             cols_m = [col_m1, col_m2, col_m3, col_m4, col_m5]
             for idx, (miss_num, miss_cnt) in enumerate(top_missing):
-                with cols_m[idx]:
-                    st.metric(label=f"號碼 {miss_num:02d}", value=f"遺漏 {miss_cnt} 期", delta="-極冷", delta_color="inverse")
+                with cols_m[idx]: st.metric(label=f"號碼 {miss_num:02d}", value=f"遺漏 {miss_cnt} 期", delta="-極冷", delta_color="inverse")
             st.divider()
 
-            # --- 5. 本日進階特徵版路 ---
             st.markdown("### 📈 進階特徵版路 & 超級獎號解析")
-            
             total_balls = len(today_data) * 20
             bigs = sum(1 for draw in today_data for n in draw['numbers'] if n >= 41)
             smalls = total_balls - bigs
@@ -420,7 +431,7 @@ def main():
                 st.markdown("**📉 整體大小/單雙**")
                 st.write(f"大區: {bigs/total_balls:.1%} | 小區: {smalls/total_balls:.1%}")
                 st.write(f"單數: {odds/total_balls:.1%} | 雙數: {evens/total_balls:.1%}")
-                st.metric("平均連莊數", f"{avg_repeat:.1f} 顆", help="每期開獎號碼中，平均有幾顆是上一期開過的")
+                st.metric("平均連莊數", f"{avg_repeat:.1f} 顆")
 
             with col_b:
                 st.markdown("**🌟 超級獎號獨立特徵**")
@@ -435,6 +446,9 @@ def main():
                 for rank, (tail_num, t_count) in enumerate(top_tails):
                     st.write(f"🏆 第 {rank+1} 名：**{tail_num} 尾** (開 {t_count} 次)")
 
+    # ==========================
+    # 🎫 Tab 3: 虛擬下注與實體匯入 (📌 增強選號面板)
+    # ==========================
     with tab3:
         st.subheader("🎫 下注與實體彩券管理中樞")
         bet_mode = st.radio("請選擇操作模式：", ["🎮 虛擬模擬下注 (測試策略)", "🧾 匯入已購買的實體彩券 (系統代管對獎)"], horizontal=True)
@@ -449,10 +463,12 @@ def main():
                 if strat == "hot": st.session_state.user_picks = BingoGameLogic.gen_smart(history_data, sc, "hot")
                 elif strat == "cold": st.session_state.user_picks = BingoGameLogic.gen_smart(history_data, sc, "cold")
                 elif strat == "mid": st.session_state.user_picks = BingoGameLogic.gen_smart(history_data, sc, "mid")
+                elif strat == "drag": st.session_state.user_picks = BingoGameLogic.gen_drag(history_data, sc)
                 elif strat == "rep": st.session_state.user_picks = BingoGameLogic.gen_repeat(history_data, sc)
                 elif strat == "tail": st.session_state.user_picks = BingoGameLogic.gen_tail(sc)
                 elif strat in ["odd", "even", "big", "small"]: st.session_state.user_picks = BingoGameLogic.gen_extreme(sc, strat)
-                elif strat == "fill": st.session_state.user_picks = BingoGameLogic.fill_remaining(st.session_state.user_picks, sc)
+                elif strat == "fill_rand": st.session_state.user_picks = BingoGameLogic.fill_remaining_rand(st.session_state.user_picks, sc)
+                elif strat == "fill_hot": st.session_state.user_picks = BingoGameLogic.fill_remaining_hot(st.session_state.user_picks, sc, history_data)
 
             def on_star_change():
                 sc = st.session_state.star_input
@@ -477,20 +493,32 @@ def main():
 
                 c1, c2 = st.columns([1, 4])
                 with c1: star_count = st.number_input("📌 單筆星數", 1, 10, 5, key="star_input", on_change=on_star_change)
-                with c2: st.multiselect("✍️ 手動選號 (或套用策略)", range(1, 81), max_selections=star_count, key="user_picks")
+                with c2: st.multiselect("✍️ 手動選號 (或點擊下方策略全自動產生)", range(1, 81), max_selections=star_count, key="user_picks")
                 
-                st.markdown("##### ⚡ 單組選號策略")
+                # 📌 擴展版專業選號工具箱
+                st.markdown("##### 🧰 專業選號工具箱 (點擊自動套用)")
                 r1c1, r1c2, r1c3, r1c4 = st.columns(4)
                 r1c1.button("🔥 熱門特徵", on_click=apply_strat, args=("hot",), use_container_width=True)
                 r1c2.button("❄️ 冷門特徵", on_click=apply_strat, args=("cold",), use_container_width=True)
-                r1c3.button("☯️ 溫態 (非冷非熱)", on_click=apply_strat, args=("mid",), use_container_width=True)
-                r1c4.button("💡 保留已選，隨機補滿", on_click=apply_strat, args=("fill",), use_container_width=True)
+                r1c3.button("☯️ 溫態避險", on_click=apply_strat, args=("mid",), use_container_width=True)
+                r1c4.button("🧲 上期拖牌", on_click=apply_strat, args=("drag",), use_container_width=True, help="根據上一期開獎號碼，尋找最容易跟著開出的拖牌號碼")
+
+                r2c1, r2c2, r2c3, r2c4 = st.columns(4)
+                r2c1.button("🔴 全單數", on_click=apply_strat, args=("odd",), use_container_width=True)
+                r2c2.button("🔵 全雙數", on_click=apply_strat, args=("even",), use_container_width=True)
+                r2c3.button("📈 全大區(41-80)", on_click=apply_strat, args=("big",), use_container_width=True)
+                r2c4.button("📉 全小區(1-40)", on_click=apply_strat, args=("small",), use_container_width=True)
+
+                r3c1, r3c2, r3c3 = st.columns([1,1,2])
+                r3c1.button("🎯 同尾數", on_click=apply_strat, args=("tail",), use_container_width=True)
+                r3c2.button("💡 隨機補滿", on_click=apply_strat, args=("fill_rand",), use_container_width=True)
+                r3c3.button("🧠 保留已選，用【熱門號】自動補滿", on_click=apply_strat, args=("fill_hot",), use_container_width=True)
                 
-                st.button("➕ 將上方號碼加入待結帳區", on_click=add_single_to_cart, use_container_width=True)
+                st.button("➕ 將上方號碼加入待結帳區", on_click=add_single_to_cart, use_container_width=True, type="secondary")
                 if st.session_state.cart_warning: st.warning("⚠️ 請選滿號碼再加入！")
 
                 st.divider()
-                st.markdown(f"##### 🚀 一鍵批次包牌 (直接產生 `{batch_count}` 組)")
+                st.markdown(f"##### 🚀 一鍵批次包牌 (直接產生 `{batch_count}` 組加入購物車)")
                 b1, b2, b3, b4 = st.columns(4)
                 if b1.button(f"🎲 機選 {batch_count} 組", use_container_width=True):
                     for _ in range(batch_count): st.session_state.cart.append({"star": star_count, "picks": sorted(random.sample(range(1, 81), star_count))})
@@ -498,8 +526,8 @@ def main():
                 if b2.button(f"🔥 熱門 {batch_count} 組", use_container_width=True):
                     for _ in range(batch_count): st.session_state.cart.append({"star": star_count, "picks": BingoGameLogic.gen_smart(history_data, star_count, "hot")})
                     st.rerun()
-                if b3.button(f"☯️ 溫態 {batch_count} 組", use_container_width=True):
-                    for _ in range(batch_count): st.session_state.cart.append({"star": star_count, "picks": BingoGameLogic.gen_smart(history_data, star_count, "mid")})
+                if b3.button(f"🧲 拖牌 {batch_count} 組", use_container_width=True):
+                    for _ in range(batch_count): st.session_state.cart.append({"star": star_count, "picks": BingoGameLogic.gen_drag(history_data, star_count)})
                     st.rerun()
                 if b4.button(f"🔁 連莊 {batch_count} 組", use_container_width=True):
                     for _ in range(batch_count): st.session_state.cart.append({"star": star_count, "picks": BingoGameLogic.gen_repeat(history_data, star_count)})
