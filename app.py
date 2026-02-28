@@ -9,35 +9,28 @@ import json
 import os
 from typing import List, Dict, Tuple
 from datetime import datetime, timedelta, timezone
-from scipy.stats import chisquare
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==========================================
-# 1. 資料層 (Model) - 📌 加入錨點時鐘同步技術
+# 1. 資料層 (Model)
 # ==========================================
 class BingoScraper:
     @staticmethod
     def _extract_time(item: dict, fallback_date: str) -> str:
-        """攔截殭屍時間，並暴力萃取正確時間格式"""
         keys_to_try = ["drawDate", "openDate", "drawTime", "openTime", "listDate", "Opendate", "DrawDate", "date", "time"]
         for k in keys_to_try:
             val = item.get(k)
             if val and isinstance(val, str):
-                if "0001-01-01" in val: continue # 📌 攔截 C# 的預設空值
-                if "T" in val and len(val) >= 16:
-                    return val[:16].replace("T", " ")
-                elif len(val) >= 5 and ":" in val:
-                    return f"{fallback_date} {val[:5]}"
+                if "0001-01-01" in val: continue
+                if "T" in val and len(val) >= 16: return val[:16].replace("T", " ")
+                elif len(val) >= 5 and ":" in val: return f"{fallback_date} {val[:5]}"
         
         for val in item.values():
             if isinstance(val, str):
                 if "0001-01-01" in val: continue
-                if "T" in val and len(val) >= 16 and val[13] == ":":
-                    return val[:16].replace("T", " ")
-                elif len(val) >= 5 and val[2] == ":" and val[:2].isdigit():
-                    return f"{fallback_date} {val[:5]}"
-                    
+                if "T" in val and len(val) >= 16 and val[13] == ":": return val[:16].replace("T", " ")
+                elif len(val) >= 5 and val[2] == ":" and val[:2].isdigit(): return f"{fallback_date} {val[:5]}"
         return f"{fallback_date} 未知"
 
     @staticmethod
@@ -48,15 +41,12 @@ class BingoScraper:
         response.raise_for_status()
         data = response.json()
         
-        if data.get("rtCode") != 0 or "content" not in data:
-            return []
+        if data.get("rtCode") != 0 or "content" not in data: return []
             
         valid_items = [item for item in data["content"]["bingoQueryResult"] if item.get("bigShowOrder") and item.get("bullEyeTop") != "－"]
         if not valid_items: return []
         
-        # 📌 尋找「時間正常」的錨點期數
-        anchor_issue = None
-        anchor_time = None
+        anchor_issue, anchor_time = None, None
         for item in valid_items:
             t = BingoScraper._extract_time(item, date_str)
             if "未知" not in t:
@@ -66,7 +56,6 @@ class BingoScraper:
                     break
                 except Exception: pass
         
-        # 如果整天都壞掉，以當天最小期數為 07:05 為基準
         if anchor_issue is None:
             anchor_issue = min(int(item["drawTerm"]) for item in valid_items)
             anchor_time = datetime.strptime(f"{date_str} 07:05", "%Y-%m-%d %H:%M")
@@ -76,13 +65,11 @@ class BingoScraper:
             issue_str = str(item["drawTerm"])
             extracted_time = BingoScraper._extract_time(item, date_str)
             
-            # 📌 啟動時鐘同步：用 5 分鐘法則換算出正確時間
             if "未知" in extracted_time:
                 try:
                     issue_diff = int(issue_str) - anchor_issue
                     extracted_time = (anchor_time + timedelta(minutes=5 * issue_diff)).strftime("%Y-%m-%d %H:%M")
-                except Exception:
-                    pass
+                except Exception: pass
 
             history_draws.append({
                 "issue": issue_str,
@@ -97,7 +84,6 @@ class BingoScraper:
     def fetch_range(start_issue: str, count: int, history_data: List[Dict]) -> List[Dict]:
         start_issue_int = int(start_issue)
         start_date_str = None
-        
         for item in history_data:
             if item["issue"] == start_issue:
                 start_date_str = item.get("date")
@@ -108,54 +94,37 @@ class BingoScraper:
                 latest_issue_int = int(history_data[0]["issue"])
                 latest_date_str = history_data[0].get("date", datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d"))
                 latest_date = datetime.strptime(latest_date_str, "%Y-%m-%d")
-                
                 diff = latest_issue_int - start_issue_int
                 if diff > 0:
-                    days_ago = diff // 203 
-                    start_date_str = (latest_date - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+                    start_date_str = (latest_date - timedelta(days=diff // 203)).strftime("%Y-%m-%d")
                 else:
                     start_date_str = latest_date_str
             except Exception: pass
 
-        if not start_date_str:
-            start_date_str = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
-
-        try:
-            start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
-        except ValueError:
-            start_date = datetime.now(timezone(timedelta(hours=8)))
+        if not start_date_str: start_date_str = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        try: start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
+        except ValueError: start_date = datetime.now(timezone(timedelta(hours=8)))
             
         days_to_fetch = (count // 203) + 3
         fetch_start = start_date - timedelta(days=1)
         
         all_draws = []
         for i in range(days_to_fetch):
-            d_str = (fetch_start + timedelta(days=i)).strftime("%Y-%m-%d")
-            all_draws.extend(BingoScraper._fetch_by_date(d_str))
+            all_draws.extend(BingoScraper._fetch_by_date((fetch_start + timedelta(days=i)).strftime("%Y-%m-%d")))
             
         issue_dict = {item["issue"]: item for item in all_draws}
-        results = []
-        for i in range(count):
-            iss = str(start_issue_int + i)
-            if iss in issue_dict:
-                results.append(issue_dict[iss])
-                
-        return results
+        return [issue_dict[str(start_issue_int + i)] for i in range(count) if str(start_issue_int + i) in issue_dict]
 
     @staticmethod
     @st.cache_data(ttl=30, show_spinner=False)
     def fetch_data() -> Tuple[List[Dict], str]:
-        tw_tz = timezone(timedelta(hours=8))
-        now = datetime.now(tw_tz)
+        now = datetime.now(timezone(timedelta(hours=8)))
         history_draws = []
         try:
             for i in range(3):
-                target_date = (now - timedelta(days=i)).strftime("%Y-%m-%d")
-                history_draws.extend(BingoScraper._fetch_by_date(target_date))
-                
-            if not history_draws: raise ValueError("近期皆無開獎資料，請稍後再試。")
-            start_date, end_date = (now - timedelta(days=2)).strftime("%m/%d"), now.strftime("%m/%d")
-            return history_draws, f"{start_date} ~ {end_date}"
+                history_draws.extend(BingoScraper._fetch_by_date((now - timedelta(days=i)).strftime("%Y-%m-%d")))
+            if not history_draws: raise ValueError("近期皆無開獎資料。")
+            return history_draws, f"{(now - timedelta(days=2)).strftime('%m/%d')} ~ {now.strftime('%m/%d')}"
         except requests.exceptions.RequestException as e:
             raise ConnectionError(f"API 連線異常: {e}")
 
@@ -164,32 +133,45 @@ class BingoScraper:
 # ==========================================
 class StorageManager:
     FILE_PATH = "bingo_bets_history.json"
+    
     @staticmethod
-    def load_bets() -> List[Dict]:
+    def load_all() -> Dict[str, List[Dict]]:
         if os.path.exists(StorageManager.FILE_PATH):
             try:
-                with open(StorageManager.FILE_PATH, "r", encoding="utf-8") as f: return json.load(f)
-            except Exception: return []
-        return []
+                with open(StorageManager.FILE_PATH, "r", encoding="utf-8") as f: 
+                    return json.load(f)
+            except Exception: 
+                return {}
+        return {}
+
     @staticmethod
-    def save_bets(bets: List[Dict]):
-        with open(StorageManager.FILE_PATH, "w", encoding="utf-8") as f: json.dump(bets, f, ensure_ascii=False, indent=4)
+    def load_bets(username: str) -> List[Dict]:
+        all_data = StorageManager.load_all()
+        return all_data.get(username, [])
+
+    @staticmethod
+    def save_bets(username: str, bets: List[Dict]):
+        all_data = StorageManager.load_all()
+        all_data[username] = bets
+        with open(StorageManager.FILE_PATH, "w", encoding="utf-8") as f: 
+            json.dump(all_data, f, ensure_ascii=False, indent=4)
 
 # ==========================================
 # 3. 邏輯層 (Controller)
 # ==========================================
 class BingoGameLogic:
+    # 📌 100% 精準校正：2026 台彩官方 1~6 星限時加碼金額表
     PRIZE_TABLE = {
         10: {10: 5000000, 9: 250000, 8: 25000, 7: 2500, 6: 250, 5: 25, 0: 25},
         9: {9: 1000000, 8: 100000, 7: 3000, 6: 500, 5: 100, 4: 25, 0: 25},
         8: {8: 500000, 7: 20000, 6: 1000, 5: 200, 4: 25, 0: 25},
         7: {7: 80000, 6: 3000, 5: 300, 4: 50, 3: 25},
-        6: {6: 50000, 5: 1200, 4: 200, 3: 25},
-        5: {5: 15000, 4: 600, 3: 50},
-        4: {4: 2000, 3: 150, 2: 25},
-        3: {3: 1000, 2: 50},
-        2: {2: 150, 1: 25},
-        1: {1: 100}
+        6: {6: 50000, 5: 1200, 4: 200, 3: 25}, 
+        5: {5: 10000, 4: 600, 3: 50},          
+        4: {4: 2000, 3: 150, 2: 25},           
+        3: {3: 1000, 2: 50},                   
+        2: {2: 150, 1: 25},                    
+        1: {1: 75}                             
     }
     
     @staticmethod
@@ -197,7 +179,8 @@ class BingoGameLogic:
         return BingoGameLogic.PRIZE_TABLE.get(star_count, {}).get(matched_count, 0) * multiplier
 
     @staticmethod
-    def get_frequencies(history: List[Dict]) -> Counter: return Counter([num for draw in history for num in draw['numbers']])
+    def get_frequencies(history: List[Dict]) -> Counter: 
+        return Counter([num for draw in history for num in draw['numbers']])
 
     @staticmethod
     def gen_smart(history: List[Dict], star: int, mode="hot") -> List[int]:
@@ -235,13 +218,6 @@ class BingoGameLogic:
         if len(picks) >= star: return sorted(picks)
         return sorted(picks + random.sample(list(set(range(1, 81)) - set(picks)), star - len(picks)))
 
-    @staticmethod
-    def run_chi2(history: List[Dict]) -> Tuple[float, float, List[int], float]:
-        exp_freq = len(history) * (20 / 80)
-        obs_freqs = [BingoGameLogic.get_frequencies(history).get(i, 0) for i in range(1, 81)]
-        chi2, p = chisquare(f_obs=obs_freqs, f_exp=[exp_freq] * 80)
-        return chi2, p, obs_freqs, exp_freq
-
 # ==========================================
 # 4. 視覺層 (View)
 # ==========================================
@@ -261,6 +237,9 @@ class BingoUI:
             div[data-testid="stMetricValue"] { font-size: 2rem; }
             .time-tag { color: #666; font-size: 0.85em; margin-left: 10px; background: #eee; padding: 2px 8px; border-radius: 12px; }
             .bonus-tag { background: linear-gradient(90deg, #ff416c, #ff4b2b); color: white; padding: 4px 12px; border-radius: 15px; font-weight: bold; margin-bottom: 10px; display: inline-block; }
+            .assoc-box { background-color: #f8f9fa; padding: 15px; border-radius: 10px; margin-bottom: 10px; border-left: 5px solid #007AFF;}
+            .type-tag-real { background-color: #34C759; color: white; padding: 2px 8px; border-radius: 10px; font-size: 0.8em; }
+            .type-tag-virtual { background-color: #007AFF; color: white; padding: 2px 8px; border-radius: 10px; font-size: 0.8em; }
         </style>
         """, unsafe_allow_html=True)
 
@@ -277,12 +256,24 @@ class BingoUI:
 def main():
     BingoUI.setup()
 
-    if 'bet_history' not in st.session_state: st.session_state.bet_history = StorageManager.load_bets()
-    if 'user_picks' not in st.session_state: st.session_state.user_picks = []
-    if 'cart' not in st.session_state: st.session_state.cart = []
+    with st.sidebar:
+        st.title("👤 玩家帳戶系統")
+        input_user = st.text_input("請輸入您的專屬暱稱：", value="預設玩家", help="輸入不同暱稱即可切換帳號，歷史紀錄完全獨立！")
+        
+        if 'current_user' not in st.session_state or st.session_state.current_user != input_user:
+            st.session_state.current_user = input_user
+            st.session_state.bet_history = StorageManager.load_bets(input_user)
+            st.session_state.cart = [] 
+            st.session_state.user_picks = []
+            st.session_state.import_picks = []
+        
+        st.success(f"目前登入身份：**{st.session_state.current_user}**")
+        st.divider()
+        st.markdown("💡 **操作提示**\n只要不清除瀏覽器快取或刪除後台檔案，您的紀錄將永久保存在此暱稱下。")
+
     if 'cart_warning' not in st.session_state: st.session_state.cart_warning = False
 
-    st.title("🎰 BINGO BINGO 真實對獎與包牌系統 (🎉 限時加碼版)")
+    st.title("🎰 BINGO BINGO 真實對獎與包牌系統")
     st.markdown("<div class='bonus-tag'>🔥 系統已全面套用 2026 台彩最新「1~6 星」限時加碼賠率！</div>", unsafe_allow_html=True)
 
     try:
@@ -291,138 +282,317 @@ def main():
     except Exception as e:
         st.error(f"🚨 系統連線失敗: {e}"); st.stop()
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "📊 開獎紀錄", "🔥 號碼分析", "🎫 購物車下注", "📋 我的投注紀錄", "🕵️‍♂️ 異常偵測", "🎯 實體彩券對獎"
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "📊 開獎紀錄", "🔥 今日走勢與深度分析", "🎫 虛擬下注 & 實體匯入", "📋 我的投注紀錄", "🎯 單次實體對獎"
     ])
 
     with tab1:
-        st.subheader(f"📝 近期開獎紀錄 (共載入 {len(history_data)} 期 | {target_date})")
+        st.subheader(f"📝 近期開獎紀錄 (共載入 {len(history_data)} 期 | 涵蓋 {target_date})")
         with st.container(height=650):
-            for draw in history_data:
+            for draw in history_data[:200]:
                 with st.container(border=True):
                     c1, c2 = st.columns([1, 4])
                     c1.markdown(f"**第 `{draw['issue']}` 期**<br><span class='time-tag'>🕒 {draw['time']}</span>", unsafe_allow_html=True)
                     c2.markdown(BingoUI.render_balls(draw['numbers'], "normal") + BingoUI.render_balls(draw['super_num'], "super"), unsafe_allow_html=True)
 
+    # ==========================
+    # 🔥 Tab 2: 深度盤勢分析 (新增 Top 15)
+    # ==========================
     with tab2:
-        st.subheader(f"📈 頻率分析 ({len(history_data)} 期龐大樣本)")
-        df = pd.DataFrame(BingoGameLogic.get_frequencies(history_data).items(), columns=["Num", "Count"]).sort_values("Count", ascending=False)
-        df["Num"] = df["Num"].apply(lambda x: f"{x:02d}")
+        st.subheader("📊 今日專屬實戰盤勢分析")
+        today_str = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        today_data = [d for d in history_data if d["time"].startswith(today_str) or d.get("date") == today_str]
         
-        c1, c2 = st.columns([3, 1])
-        c1.bar_chart(df.set_index("Num"), color="#FFD700")
-        with c2:
-            st.write("**🔥 前 5 熱門**")
-            for _, r in df.head(5).iterrows(): st.markdown(f"`{r['Num']}` ({r['Count']}次)")
-            st.write("**❄️ 前 5 冷門**")
-            for _, r in df.tail(5).iterrows(): st.markdown(f"`{r['Num']}` ({r['Count']}次)")
+        if not today_data and history_data:
+            latest_date_str = history_data[0].get("date", history_data[0]["time"][:10])
+            today_data = [d for d in history_data if d["time"].startswith(latest_date_str) or d.get("date") == latest_date_str]
+            st.info(f"💡 今日 ({today_str}) 尚未有開獎資料，以下顯示最新開獎日 ({latest_date_str}) 的盤勢分析。")
+
+        st.markdown(f"**📍 本日已開出：** `{len(today_data)}` 期")
+        
+        if today_data:
+            counter = BingoGameLogic.get_frequencies(today_data)
+            
+            # --- 1. 完整 80 號極端冷熱門排行榜 (Top 15) 📌 新增 ---
+            st.markdown("### 🏆 今日極端冷熱門排行榜 (Top 15)")
+            
+            # 建立包含 1~80 號完整資料的字典 (沒開出的補 0)
+            full_counts = {i: counter.get(i, 0) for i in range(1, 81)}
+            
+            # 熱門排序 (次數由多到少 -> 次數相同則號碼由小到大)
+            sorted_hot = sorted(full_counts.items(), key=lambda x: (-x[1], x[0]))[:15]
+            # 冷門排序 (次數由少到多 -> 次數相同則號碼由小到大)
+            sorted_cold = sorted(full_counts.items(), key=lambda x: (x[1], x[0]))[:15]
+
+            col_hot, col_cold = st.columns(2)
+            with col_hot:
+                st.markdown("##### 🔥 最常出現 15 名")
+                df_hot = pd.DataFrame(sorted_hot, columns=["號碼", "出現次數"])
+                df_hot["號碼"] = df_hot["號碼"].apply(lambda x: f"🔥 {x:02d}")
+                df_hot.index = range(1, 16) # 讓 Index 從 1 開始
+                st.dataframe(df_hot, use_container_width=True)
+            
+            with col_cold:
+                st.markdown("##### ❄️ 最少出現 15 名")
+                df_cold = pd.DataFrame(sorted_cold, columns=["號碼", "出現次數"])
+                df_cold["號碼"] = df_cold["號碼"].apply(lambda x: f"❄️ {x:02d}")
+                df_cold.index = range(1, 16) # 讓 Index 從 1 開始
+                st.dataframe(df_cold, use_container_width=True)
+            
+            st.divider()
+
+            # --- 2. 區間熱力分佈 ---
+            st.markdown("### 🌡️ 號碼區間熱度分佈")
+            zones = {f"{i*10+1:02d}-{i*10+10:02d}": 0 for i in range(8)}
+            for num, cnt in counter.items():
+                zone_idx = (num - 1) // 10
+                zones[f"{zone_idx*10+1:02d}-{zone_idx*10+10:02d}"] += cnt
+            
+            df_zones = pd.DataFrame(list(zones.items()), columns=["區間", "開出總次數"]).set_index("區間")
+            st.bar_chart(df_zones, color="#FF4B2B")
+            hottest_zone = max(zones, key=zones.get)
+            st.caption(f"💡 目前最燙手的板塊為 **「{hottest_zone}」** 區間，喜歡包牌的玩家可鎖定此範圍。")
+            st.divider()
+
+            # --- 3. 焦點熱門號 & 共伴拖牌效應 ---
+            st.markdown("### 🎯 焦點霸主 & 共伴拖牌效應")
+            top_hot_5 = counter.most_common(5)
+            for hot_num, count in top_hot_5:
+                associated_nums = []
+                for draw in today_data:
+                    if hot_num in draw['numbers']:
+                        associated_nums.extend([n for n in draw['numbers'] if n != hot_num])
+                assoc_top3 = Counter(associated_nums).most_common(3)
+                with st.container():
+                    st.markdown(f"""
+                    <div class='assoc-box'>
+                        <strong style='font-size: 1.2em; color: #FF3B30;'>今日霸主 {hot_num:02d} (開出 {count} 次)</strong> <br>
+                        🎯 常伴隨開出 (拖牌)：
+                        {'、 '.join([f"「{n:02d}」({c}次)" for n, c in assoc_top3])}
+                    </div>
+                    """, unsafe_allow_html=True)
+            st.divider()
+
+            # --- 4. 極端遺漏值追蹤 (冷牌回補) ---
+            st.markdown("### 🥶 極端冷牌追蹤 (最大遺漏期數)")
+            st.markdown("尋找已經非常久沒開出來的號碼，適合喜歡等「觸底反彈」的冷牌策略玩家。")
+            
+            last_seen = {i: -1 for i in range(1, 81)}
+            for current_idx, draw in enumerate(today_data):
+                for num in draw['numbers']:
+                    if last_seen[num] == -1:
+                        last_seen[num] = current_idx
+            
+            missing_counts = {num: (idx if idx != -1 else len(today_data)) for num, idx in last_seen.items()}
+            top_missing = sorted(missing_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+            
+            col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
+            cols_m = [col_m1, col_m2, col_m3, col_m4, col_m5]
+            for idx, (miss_num, miss_cnt) in enumerate(top_missing):
+                with cols_m[idx]:
+                    st.metric(label=f"號碼 {miss_num:02d}", value=f"遺漏 {miss_cnt} 期", delta="-極冷", delta_color="inverse")
+            st.divider()
+
+            # --- 5. 本日進階特徵版路 ---
+            st.markdown("### 📈 進階特徵版路 & 超級獎號解析")
+            
+            total_balls = len(today_data) * 20
+            bigs = sum(1 for draw in today_data for n in draw['numbers'] if n >= 41)
+            smalls = total_balls - bigs
+            odds = sum(1 for draw in today_data for n in draw['numbers'] if n % 2 != 0)
+            evens = total_balls - odds
+            
+            repeats = []
+            for i in range(len(today_data)-1):
+                curr_set = set(today_data[i]['numbers'])
+                prev_set = set(today_data[i+1]['numbers'])
+                repeats.append(len(curr_set & prev_set))
+            avg_repeat = sum(repeats) / len(repeats) if repeats else 0
+
+            super_nums = [draw['super_num'] for draw in today_data]
+            super_big = sum(1 for n in super_nums if n >= 41)
+            super_small = len(super_nums) - super_big
+            super_odd = sum(1 for n in super_nums if n % 2 != 0)
+            super_even = len(super_nums) - super_odd
+
+            col_a, col_b, col_c = st.columns(3)
+            with col_a:
+                st.markdown("**📉 整體大小/單雙**")
+                st.write(f"大區: {bigs/total_balls:.1%} | 小區: {smalls/total_balls:.1%}")
+                st.write(f"單數: {odds/total_balls:.1%} | 雙數: {evens/total_balls:.1%}")
+                st.metric("平均連莊數", f"{avg_repeat:.1f} 顆", help="每期開獎號碼中，平均有幾顆是上一期開過的")
+
+            with col_b:
+                st.markdown("**🌟 超級獎號獨立特徵**")
+                st.write(f"大區: {super_big} 次 | 小區: {super_small} 次")
+                st.write(f"單數: {super_odd} 次 | 雙數: {super_even} 次")
+                st.caption("玩超級獎號的玩家請留意此偏差走勢！")
+
+            tails = [n % 10 for draw in today_data for n in draw['numbers']]
+            top_tails = Counter(tails).most_common(3)
+            with col_c:
+                st.markdown("**🎯 最旺尾數排行**")
+                for rank, (tail_num, t_count) in enumerate(top_tails):
+                    st.write(f"🏆 第 {rank+1} 名：**{tail_num} 尾** (開 {t_count} 次)")
 
     with tab3:
-        next_issue = latest_issue + 1
-        st.subheader(f"🎫 下注看盤區 (目標起算期數: `{next_issue}`)")
-        st.info("💡 **提示：** 本期熱門玩法「3 星」與「6 星」獎金皆已翻倍！利用下方倍數可嘗試網路瘋傳的『三星4倍』策略。")
-        
-        def apply_strat(strat, *args):
-            sc = st.session_state.star_input
-            if strat == "hot": st.session_state.user_picks = BingoGameLogic.gen_smart(history_data, sc, "hot")
-            elif strat == "cold": st.session_state.user_picks = BingoGameLogic.gen_smart(history_data, sc, "cold")
-            elif strat == "mid": st.session_state.user_picks = BingoGameLogic.gen_smart(history_data, sc, "mid")
-            elif strat == "rep": st.session_state.user_picks = BingoGameLogic.gen_repeat(history_data, sc)
-            elif strat == "tail": st.session_state.user_picks = BingoGameLogic.gen_tail(sc)
-            elif strat in ["odd", "even", "big", "small"]: st.session_state.user_picks = BingoGameLogic.gen_extreme(sc, strat)
-            elif strat == "fill": st.session_state.user_picks = BingoGameLogic.fill_remaining(st.session_state.user_picks, sc)
+        st.subheader("🎫 下注與實體彩券管理中樞")
+        bet_mode = st.radio("請選擇操作模式：", ["🎮 虛擬模擬下注 (測試策略)", "🧾 匯入已購買的實體彩券 (系統代管對獎)"], horizontal=True)
+        st.divider()
 
-        def on_star_change():
-            sc = st.session_state.star_input
-            if len(st.session_state.user_picks) > sc: st.session_state.user_picks = st.session_state.user_picks[:sc]
-
-        def add_single_to_cart():
-            sc = st.session_state.star_input
-            picks = st.session_state.user_picks
-            if len(picks) == sc:
-                st.session_state.cart.append({"star": sc, "picks": picks.copy()})
-                st.session_state.user_picks = [] 
-                st.session_state.cart_warning = False
-            else:
-                st.session_state.cart_warning = True
-
-        with st.container(border=True):
-            g1, g2, g3 = st.columns(3)
-            multiplier = g1.number_input("💰 全局倍數", 1, 50, 1)
-            multi_draw = g2.number_input("🔁 連續買幾期", 1, 50, 1)
-            batch_count = g3.number_input("⚡ 批次產生組數", 1, 50, 1)
-            st.divider()
-
-            c1, c2 = st.columns([1, 4])
-            with c1: star_count = st.number_input("📌 單筆星數", 1, 10, 5, key="star_input", on_change=on_star_change)
-            with c2: st.multiselect("✍️ 手動選號 (或套用策略)", range(1, 81), max_selections=star_count, key="user_picks")
+        if bet_mode == "🎮 虛擬模擬下注 (測試策略)":
+            next_issue = latest_issue + 1
+            st.info(f"💡 目前虛擬下注的目標起算期數為：**第 `{next_issue}` 期**")
             
-            st.markdown("##### ⚡ 單組選號策略")
-            r1c1, r1c2, r1c3, r1c4 = st.columns(4)
-            r1c1.button("🔥 熱門特徵", on_click=apply_strat, args=("hot",), use_container_width=True)
-            r1c2.button("❄️ 冷門特徵", on_click=apply_strat, args=("cold",), use_container_width=True)
-            r1c3.button("☯️ 溫態 (非冷非熱)", on_click=apply_strat, args=("mid",), use_container_width=True)
-            r1c4.button("💡 保留已選，隨機補滿", on_click=apply_strat, args=("fill",), use_container_width=True)
+            def apply_strat(strat, *args):
+                sc = st.session_state.star_input
+                if strat == "hot": st.session_state.user_picks = BingoGameLogic.gen_smart(history_data, sc, "hot")
+                elif strat == "cold": st.session_state.user_picks = BingoGameLogic.gen_smart(history_data, sc, "cold")
+                elif strat == "mid": st.session_state.user_picks = BingoGameLogic.gen_smart(history_data, sc, "mid")
+                elif strat == "rep": st.session_state.user_picks = BingoGameLogic.gen_repeat(history_data, sc)
+                elif strat == "tail": st.session_state.user_picks = BingoGameLogic.gen_tail(sc)
+                elif strat in ["odd", "even", "big", "small"]: st.session_state.user_picks = BingoGameLogic.gen_extreme(sc, strat)
+                elif strat == "fill": st.session_state.user_picks = BingoGameLogic.fill_remaining(st.session_state.user_picks, sc)
+
+            def on_star_change():
+                sc = st.session_state.star_input
+                if len(st.session_state.user_picks) > sc: st.session_state.user_picks = st.session_state.user_picks[:sc]
+
+            def add_single_to_cart():
+                sc = st.session_state.star_input
+                picks = st.session_state.user_picks
+                if len(picks) == sc:
+                    st.session_state.cart.append({"star": sc, "picks": picks.copy()})
+                    st.session_state.user_picks = [] 
+                    st.session_state.cart_warning = False
+                else:
+                    st.session_state.cart_warning = True
+
+            with st.container(border=True):
+                g1, g2, g3 = st.columns(3)
+                multiplier = g1.number_input("💰 全局倍數", 1, 50, 1)
+                multi_draw = g2.number_input("🔁 連續買幾期", 1, 50, 1)
+                batch_count = g3.number_input("⚡ 批次產生組數", 1, 50, 1)
+                st.divider()
+
+                c1, c2 = st.columns([1, 4])
+                with c1: star_count = st.number_input("📌 單筆星數", 1, 10, 5, key="star_input", on_change=on_star_change)
+                with c2: st.multiselect("✍️ 手動選號 (或套用策略)", range(1, 81), max_selections=star_count, key="user_picks")
+                
+                st.markdown("##### ⚡ 單組選號策略")
+                r1c1, r1c2, r1c3, r1c4 = st.columns(4)
+                r1c1.button("🔥 熱門特徵", on_click=apply_strat, args=("hot",), use_container_width=True)
+                r1c2.button("❄️ 冷門特徵", on_click=apply_strat, args=("cold",), use_container_width=True)
+                r1c3.button("☯️ 溫態 (非冷非熱)", on_click=apply_strat, args=("mid",), use_container_width=True)
+                r1c4.button("💡 保留已選，隨機補滿", on_click=apply_strat, args=("fill",), use_container_width=True)
+                
+                st.button("➕ 將上方號碼加入待結帳區", on_click=add_single_to_cart, use_container_width=True)
+                if st.session_state.cart_warning: st.warning("⚠️ 請選滿號碼再加入！")
+
+                st.divider()
+                st.markdown(f"##### 🚀 一鍵批次包牌 (直接產生 `{batch_count}` 組)")
+                b1, b2, b3, b4 = st.columns(4)
+                if b1.button(f"🎲 機選 {batch_count} 組", use_container_width=True):
+                    for _ in range(batch_count): st.session_state.cart.append({"star": star_count, "picks": sorted(random.sample(range(1, 81), star_count))})
+                    st.rerun()
+                if b2.button(f"🔥 熱門 {batch_count} 組", use_container_width=True):
+                    for _ in range(batch_count): st.session_state.cart.append({"star": star_count, "picks": BingoGameLogic.gen_smart(history_data, star_count, "hot")})
+                    st.rerun()
+                if b3.button(f"☯️ 溫態 {batch_count} 組", use_container_width=True):
+                    for _ in range(batch_count): st.session_state.cart.append({"star": star_count, "picks": BingoGameLogic.gen_smart(history_data, star_count, "mid")})
+                    st.rerun()
+                if b4.button(f"🔁 連莊 {batch_count} 組", use_container_width=True):
+                    for _ in range(batch_count): st.session_state.cart.append({"star": star_count, "picks": BingoGameLogic.gen_repeat(history_data, star_count)})
+                    st.rerun()
+
+            if st.session_state.cart:
+                st.markdown("### 🛒 待下注購物車")
+                for i, item in enumerate(st.session_state.cart):
+                    with st.container(border=True):
+                        cart_c1, cart_c2 = st.columns([10, 1])
+                        cart_c1.markdown(f"**{item['star']} 星** | " + BingoUI.render_balls(item['picks'], "user"), unsafe_allow_html=True)
+                        if cart_c2.button("❌", key=f"del_cart_{i}"):
+                            st.session_state.cart.pop(i)
+                            st.rerun()
+                
+                cart_total_cost = len(st.session_state.cart) * 25 * multiplier * multi_draw
+                st.info(f"🧾 本次結帳總計: **{len(st.session_state.cart)}** 組選號 x **{multiplier}** 倍 x **{multi_draw}** 期 = 扣除本金 **NT$ {cart_total_cost:,}**")
+
+                col_submit, col_clear = st.columns([3, 1])
+                if col_submit.button("📝 確認送出虛擬注單", type="primary", use_container_width=True):
+                    for item in st.session_state.cart:
+                        for i in range(multi_draw):
+                            st.session_state.bet_history.insert(0, {
+                                "type": "virtual",
+                                "issue": str(next_issue + i),
+                                "star": item['star'],
+                                "multiplier": multiplier,
+                                "cost": 25 * multiplier,
+                                "prize": 0,
+                                "picks": item['picks'].copy(),
+                                "status": "waiting",
+                                "timestamp": datetime.now().strftime("%m/%d %H:%M:%S")
+                            })
+                    StorageManager.save_bets(st.session_state.current_user, st.session_state.bet_history)
+                    st.session_state.cart.clear()
+                    st.success("✅ 虛擬下注成功！資料已寫入「我的投注紀錄」。")
+                    time.sleep(1.5)
+                    st.rerun()
+                if col_clear.button("🗑️ 清空購物車", use_container_width=True):
+                    st.session_state.cart.clear(); st.rerun()
+
+        else:
+            st.markdown("#### 📥 將手邊的實體彩券匯入系統代管")
+            st.write("把彩券上的資訊輸入進來，系統會自動在後台持續幫你對獎，再也不怕漏看！")
             
-            st.button("➕ 將上方號碼加入待結帳區", on_click=add_single_to_cart, use_container_width=True)
-            if st.session_state.cart_warning: st.warning("⚠️ 請選滿號碼再加入！")
+            def on_import_star_change():
+                sc = st.session_state.import_star
+                if len(st.session_state.import_picks) > sc: 
+                    st.session_state.import_picks = st.session_state.import_picks[:sc]
 
-            st.divider()
-            st.markdown(f"##### 🚀 一鍵批次包牌 (直接產生 `{batch_count}` 組)")
-            b1, b2, b3, b4 = st.columns(4)
-            if b1.button(f"🎲 機選 {batch_count} 組", use_container_width=True):
-                for _ in range(batch_count): st.session_state.cart.append({"star": star_count, "picks": sorted(random.sample(range(1, 81), star_count))})
-                st.rerun()
-            if b2.button(f"🔥 熱門 {batch_count} 組", use_container_width=True):
-                for _ in range(batch_count): st.session_state.cart.append({"star": star_count, "picks": BingoGameLogic.gen_smart(history_data, star_count, "hot")})
-                st.rerun()
-            if b3.button(f"☯️ 溫態 {batch_count} 組", use_container_width=True):
-                for _ in range(batch_count): st.session_state.cart.append({"star": star_count, "picks": BingoGameLogic.gen_smart(history_data, star_count, "mid")})
-                st.rerun()
-            if b4.button(f"🔁 連莊 {batch_count} 組", use_container_width=True):
-                for _ in range(batch_count): st.session_state.cart.append({"star": star_count, "picks": BingoGameLogic.gen_repeat(history_data, star_count)})
-                st.rerun()
+            with st.container(border=True):
+                col_i1, col_i2, col_i3 = st.columns(3)
+                import_issue = col_i1.text_input("📌 彩券起始期號", value=str(latest_issue), key="import_issue")
+                import_draws = col_i2.number_input("🔁 連續期數", 1, 500, 1, key="import_draws")
+                import_multi = col_i3.number_input("💰 投注倍數", 1, 100, 1, key="import_multi")
 
-        if st.session_state.cart:
-            st.markdown("### 🛒 待下注購物車")
-            for i, item in enumerate(st.session_state.cart):
-                with st.container(border=True):
-                    cart_c1, cart_c2 = st.columns([10, 1])
-                    cart_c1.markdown(f"**{item['star']} 星** | " + BingoUI.render_balls(item['picks'], "user"), unsafe_allow_html=True)
-                    if cart_c2.button("❌", key=f"del_{i}"):
-                        st.session_state.cart.pop(i)
-                        st.rerun()
-            
-            cart_total_cost = len(st.session_state.cart) * 25 * multiplier * multi_draw
-            st.info(f"🧾 本次結帳總計: **{len(st.session_state.cart)}** 組選號 x **{multiplier}** 倍 x **{multi_draw}** 期 = 扣除本金 **NT$ {cart_total_cost:,}**")
+                col_i4, col_i5 = st.columns([1, 4])
+                import_star = col_i4.number_input("⭐ 玩法 (星數)", 1, 10, 5, key="import_star", on_change=on_import_star_change)
+                import_picks = col_i5.multiselect("✍️ 彩券上的號碼", range(1, 81), max_selections=import_star, key="import_picks")
 
-            col_submit, col_clear = st.columns([3, 1])
-            if col_submit.button("📝 確認送出所有注單", type="primary", use_container_width=True):
-                for item in st.session_state.cart:
-                    for i in range(multi_draw):
+            if st.button("📥 立即匯入這張彩券", type="primary", use_container_width=True):
+                if not import_issue.isdigit():
+                    st.error("⚠️ 起始期號請輸入純數字！")
+                elif len(import_picks) != import_star:
+                    st.error(f"⚠️ 號碼未選滿！這張彩券是 {import_star} 星玩法，請選滿號碼。")
+                else:
+                    start_iss_int = int(import_issue)
+                    for i in range(import_draws):
                         st.session_state.bet_history.insert(0, {
-                            "issue": str(next_issue + i),
-                            "star": item['star'],
-                            "multiplier": multiplier,
-                            "cost": 25 * multiplier,
+                            "type": "real",
+                            "issue": str(start_iss_int + i),
+                            "star": import_star,
+                            "multiplier": import_multi,
+                            "cost": 25 * import_multi,
                             "prize": 0,
-                            "picks": item['picks'].copy(),
+                            "picks": import_picks.copy(),
                             "status": "waiting",
                             "timestamp": datetime.now().strftime("%m/%d %H:%M:%S")
                         })
-                StorageManager.save_bets(st.session_state.bet_history)
-                st.session_state.cart.clear()
-                st.success("✅ 成功下注！資料已永久儲存，請至「我的投注紀錄」追蹤開獎狀態。")
-                time.sleep(1.5)
-                st.rerun()
-            if col_clear.button("🗑️ 清空購物車", use_container_width=True):
-                st.session_state.cart.clear(); st.rerun()
+                    StorageManager.save_bets(st.session_state.current_user, st.session_state.bet_history)
+                    st.session_state.import_picks = []
+                    st.success(f"✅ 成功匯入 {import_draws} 期實體彩券！請至「我的投注紀錄」查看對獎結果。")
+                    time.sleep(1.5)
+                    st.rerun()
 
     with tab4:
         is_updated = False
         for bet in st.session_state.bet_history:
             if bet["status"] == "waiting":
                 draw_result = next((item for item in history_data if item["issue"] == bet["issue"]), None)
+                if not draw_result:
+                    draw_result = BingoScraper.fetch_single_issue(bet["issue"])
+                    
                 if draw_result:
                     bet["status"] = "matched"
                     matched_nums = list(set(bet['picks']) & set(draw_result['numbers']))
@@ -430,33 +600,43 @@ def main():
                     bet["prize"] = BingoGameLogic.calculate_prize(bet["star"], len(matched_nums), bet["multiplier"])
                     bet["draw_time"] = draw_result["time"]
                     is_updated = True
-        if is_updated: StorageManager.save_bets(st.session_state.bet_history)
+                    
+        if is_updated: StorageManager.save_bets(st.session_state.current_user, st.session_state.bet_history)
 
-        st.markdown("### 💰 帳戶財務總覽 (加碼期間)")
-        total_cost = sum(b['cost'] for b in st.session_state.bet_history)
-        total_prize = sum(b['prize'] for b in st.session_state.bet_history if b['status'] == 'matched')
-        net_profit = total_prize - total_cost
+        st.markdown(f"### 💰 【{st.session_state.current_user}】專屬帳戶總覽")
+        real_cost = sum(b['cost'] for b in st.session_state.bet_history if b.get('type') == 'real')
+        real_prize = sum(b['prize'] for b in st.session_state.bet_history if b['status'] == 'matched' and b.get('type') == 'real')
         
-        col_f1, col_f2, col_f3 = st.columns(3)
-        col_f1.metric("總投入本金", f"NT$ {total_cost:,}")
-        col_f2.metric("累積派彩金額", f"NT$ {total_prize:,}")
-        col_f3.metric("總淨利 (損益)", f"NT$ {net_profit:,}", delta=int(net_profit))
+        virt_cost = sum(b['cost'] for b in st.session_state.bet_history if b.get('type') != 'real')
+        virt_prize = sum(b['prize'] for b in st.session_state.bet_history if b['status'] == 'matched' and b.get('type') != 'real')
+        
+        col_r1, col_r2, col_r3 = st.columns(3)
+        col_r1.metric("🧾 實體彩券總成本", f"NT$ {real_cost:,}")
+        col_r2.metric("🧾 實體累積中獎", f"NT$ {real_prize:,}")
+        col_r3.metric("🧾 實體淨損益", f"NT$ {real_prize - real_cost:,}", delta=int(real_prize - real_cost))
+        
+        col_v1, col_v2, col_v3 = st.columns(3)
+        col_v1.metric("🎮 虛擬測試總成本", f"NT$ {virt_cost:,}")
+        col_v2.metric("🎮 虛擬累積中獎", f"NT$ {virt_prize:,}")
+        col_v3.metric("🎮 虛擬淨損益", f"NT$ {virt_prize - virt_cost:,}", delta=int(virt_prize - virt_cost))
+        
         st.divider()
         
         c_title, c_btn1, c_btn2 = st.columns([2, 1, 1])
-        c_title.markdown("### 📋 投注明細清單")
-        if c_btn1.button("🔄 刷新開獎資料", use_container_width=True): st.cache_data.clear(); st.rerun()
-        if c_btn2.button("🗑️ 清空所有歷史注單", type="secondary", use_container_width=True):
+        c_title.markdown("### 📋 歷史明細清單")
+        if c_btn1.button("🔄 刷新最新開獎", use_container_width=True): st.cache_data.clear(); st.rerun()
+        if c_btn2.button("🗑️ 清空此帳號所有紀錄", type="secondary", use_container_width=True):
             st.session_state.bet_history = []
-            StorageManager.save_bets([]) 
+            StorageManager.save_bets(st.session_state.current_user, []) 
             st.rerun()
 
-        if not st.session_state.bet_history: st.info("目前沒有注單，趁加碼期間快去下注吧！")
+        if not st.session_state.bet_history: st.info("目前沒有注單。")
         else:
             summary_data = []
             for bet in st.session_state.bet_history:
+                b_type = "🧾 實體" if bet.get("type") == "real" else "🎮 虛擬"
                 summary_data.append({
-                    "下注時間": bet.get("timestamp", "-"),
+                    "類型": b_type,
                     "目標期數": bet["issue"],
                     "玩法": f"{bet['star']} 星",
                     "倍數": f"{bet['multiplier']} 倍",
@@ -466,12 +646,13 @@ def main():
                 })
             st.dataframe(pd.DataFrame(summary_data), use_container_width=True, hide_index=True)
             
-            st.markdown("#### 🔍 詳細對獎紀錄")
+            st.markdown("#### 🔍 詳細對獎紀錄 (中獎會自動展開)")
             for i, bet in enumerate(st.session_state.bet_history):
                 time_str = f" | 🕒 {bet.get('draw_time', '未知')}" if bet['status'] == 'matched' else ""
+                type_icon = "🧾 實體" if bet.get("type") == "real" else "🎮 虛擬"
                 
                 is_win = bet.get("prize", 0) > 0
-                exp_title = f"{'🎉' if is_win else '💨'} 第 {bet['issue']} 期 | {bet['star']}星 | 成本 ${bet['cost']} | 狀態: {'⏳ 等待開獎' if bet['status'] == 'waiting' else '✅ 已開獎'}{time_str}"
+                exp_title = f"{'🎉' if is_win else '💨'} [{type_icon}] 第 {bet['issue']} 期 | {bet['star']}星 | 成本 ${bet['cost']} | 狀態: {'⏳ 等待開獎' if bet['status'] == 'waiting' else '✅ 已開獎'}{time_str}"
                 
                 with st.expander(exp_title, expanded=is_win):
                     st.write("**你的選號：**")
@@ -480,33 +661,26 @@ def main():
                     if bet["status"] == "matched":
                         matched = bet.get("matched_nums", [])
                         draw_result = next((item for item in history_data if item["issue"] == bet["issue"]), None)
-                        st.write("**本期開獎：**")
-                        if draw_result: st.markdown(BingoUI.render_balls(draw_result['numbers'], "normal"), unsafe_allow_html=True)
+                        if not draw_result: draw_result = BingoScraper.fetch_single_issue(bet["issue"])
+                            
+                        if draw_result: 
+                            st.write("**本期開獎：**")
+                            st.markdown(BingoUI.render_balls(draw_result['numbers'], "normal"), unsafe_allow_html=True)
                         
                         if bet["prize"] > 0:
-                            if matched: st.success(f"🎉 對中 {len(matched)} 個號碼，贏得加碼獎金 **NT$ {bet['prize']:,}**")
+                            if matched: st.success(f"🎉 對中 {len(matched)} 個號碼，贏得獎金 **NT$ {bet['prize']:,}**")
                             else: st.success(f"🎉 觸發「全倒」規則 (0顆)，拿回安慰獎 **NT$ {bet['prize']:,}**")
                         else:
                             st.error(f"💨 對中 {len(matched)} 顆，未達派彩標準。")
                     
                     if st.button("🗑️ 刪除此單筆紀錄", key=f"del_hist_{i}"):
                         st.session_state.bet_history.pop(i)
-                        StorageManager.save_bets(st.session_state.bet_history) 
+                        StorageManager.save_bets(st.session_state.current_user, st.session_state.bet_history) 
                         st.rerun()
 
     with tab5:
-        st.subheader("🕵️‍♂️ 開獎機率異常偵測 (卡方檢定)")
-        chi2, p, obs, exp = BingoGameLogic.run_chi2(history_data)
-        c1, c2, c3 = st.columns(3)
-        c1.metric("卡方統計量", f"{chi2:.2f}"); c2.metric("P-Value", f"{p:.4f}"); c3.metric("樣本數", f"{len(history_data)}")
-        if p < 0.05: st.error("⚠️ **P < 0.05：出現統計學顯著異常，開獎分佈不均勻！**")
-        else: st.success("✅ **P >= 0.05：目前開獎分佈符合機率學的正常波動。**")
-        df_c = pd.DataFrame({"號碼": [f"{i:02d}" for i in range(1, 81)], "實際": obs, "期望": [exp]*80}).set_index("號碼")
-        st.line_chart(df_c, color=["#FF3B30", "#007AFF"])
-
-    with tab6:
-        st.subheader("🎯 實體彩券手動兌獎小幫手 (支援加碼賠率結算)")
-        st.markdown("可自動反查購買時間對應的期號。支援一次對獎 **高達 500 期**，系統會自動套用加碼活動的高額賠率！")
+        st.subheader("🎯 單次實體彩券速查工具")
+        st.markdown("這區適合用來「快速對獎」，對完即焚。如果你想把彩券放著讓系統自動追蹤，請使用 **「🎫 虛擬下注 & 實體匯入」** 頁籤！")
 
         def on_chk_star_change():
             if len(st.session_state.chk_picks) > st.session_state.chk_star:
