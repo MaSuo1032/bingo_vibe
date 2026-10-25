@@ -1,0 +1,11 @@
+# 使用者資料 (投注紀錄、密碼雜湊)，不應進版控
+bingo_bets_history.json
+bingo_users.json
+data/
+.bingo_*.tmp
+
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
