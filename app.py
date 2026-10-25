@@ -7,6 +7,8 @@ import random
 import time
 import json
 import os
+import tempfile
+import threading
 from typing import List, Dict, Tuple
 from datetime import datetime, timedelta, timezone
 
@@ -35,6 +37,23 @@ class BingoScraper:
 
     @staticmethod
     def _fetch_by_date(date_str: str) -> List[Dict[str, any]]:
+        # 過去日期的開獎結果不會再變動，可長時間快取；今天(含未來)仍在開獎，只快取 30 秒
+        today_str = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        if date_str < today_str: return BingoScraper._fetch_past_date(date_str)
+        return BingoScraper._fetch_recent_date(date_str)
+
+    @staticmethod
+    @st.cache_data(ttl=86400, show_spinner=False, max_entries=500)
+    def _fetch_past_date(date_str: str) -> List[Dict[str, any]]:
+        return BingoScraper._request_by_date(date_str)
+
+    @staticmethod
+    @st.cache_data(ttl=30, show_spinner=False)
+    def _fetch_recent_date(date_str: str) -> List[Dict[str, any]]:
+        return BingoScraper._request_by_date(date_str)
+
+    @staticmethod
+    def _request_by_date(date_str: str) -> List[Dict[str, any]]:
         api_url = f"https://api.taiwanlottery.com/TLCAPIWeB/Lottery/BingoResult?openDate={date_str}&pageNum=1&pageSize=250"
         headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
         response = requests.get(api_url, headers=headers, timeout=10, verify=False)
@@ -131,30 +150,50 @@ class BingoScraper:
 # ==========================================
 # 2. 儲存層 (Storage)
 # ==========================================
+class StorageError(Exception):
+    pass
+
 class StorageManager:
     FILE_PATH = "bingo_bets_history.json"
-    
+    # 所有 Streamlit session 共用同一個 process，用鎖避免「讀取→修改→寫入」互相覆蓋
+    _lock = threading.Lock()
+
     @staticmethod
     def load_all() -> Dict[str, List[Dict]]:
-        if os.path.exists(StorageManager.FILE_PATH):
-            try:
-                with open(StorageManager.FILE_PATH, "r", encoding="utf-8") as f: 
-                    return json.load(f)
-            except Exception: 
-                return {}
-        return {}
+        # 檔案不存在或為空 → 視為尚無資料；內容損毀則直接報錯，絕不回傳 {} 以免後續寫入洗掉所有玩家紀錄
+        if not os.path.exists(StorageManager.FILE_PATH) or os.path.getsize(StorageManager.FILE_PATH) == 0:
+            return {}
+        try:
+            with open(StorageManager.FILE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            raise StorageError(f"投注紀錄檔 {StorageManager.FILE_PATH} 讀取失敗，為保護資料已停止寫入: {e}")
+        if not isinstance(data, dict):
+            raise StorageError(f"投注紀錄檔 {StorageManager.FILE_PATH} 格式錯誤，為保護資料已停止寫入。")
+        return data
 
     @staticmethod
     def load_bets(username: str) -> List[Dict]:
-        all_data = StorageManager.load_all()
-        return all_data.get(username, [])
+        with StorageManager._lock:
+            return StorageManager.load_all().get(username, [])
 
     @staticmethod
     def save_bets(username: str, bets: List[Dict]):
-        all_data = StorageManager.load_all()
-        all_data[username] = bets
-        with open(StorageManager.FILE_PATH, "w", encoding="utf-8") as f: 
-            json.dump(all_data, f, ensure_ascii=False, indent=4)
+        with StorageManager._lock:
+            all_data = StorageManager.load_all()
+            all_data[username] = bets
+            # 先寫入暫存檔再原子替換，寫到一半中斷也不會留下損毀的檔案
+            dir_name = os.path.dirname(os.path.abspath(StorageManager.FILE_PATH))
+            fd, tmp_path = tempfile.mkstemp(dir=dir_name, prefix=".bets_", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(all_data, f, ensure_ascii=False, indent=4)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, StorageManager.FILE_PATH)
+            except BaseException:
+                if os.path.exists(tmp_path): os.remove(tmp_path)
+                raise
 
 # ==========================================
 # 3. 邏輯層 (Controller)
@@ -325,8 +364,12 @@ def main():
         input_user = st.text_input("請輸入您的專屬暱稱：", value="預設玩家", help="輸入不同暱稱即可切換帳號，歷史紀錄完全獨立！")
         
         if 'current_user' not in st.session_state or st.session_state.current_user != input_user:
+            try:
+                loaded_bets = StorageManager.load_bets(input_user)
+            except StorageError as e:
+                st.error(f"🚨 {e}"); st.stop()
             st.session_state.current_user = input_user
-            st.session_state.bet_history = StorageManager.load_bets(input_user)
+            st.session_state.bet_history = loaded_bets
             st.session_state.cart = [] 
             st.session_state.user_picks = []
             st.session_state.import_picks = []
@@ -658,13 +701,13 @@ def main():
 
             with st.container(border=True):
                 col_i1, col_i2, col_i3 = st.columns(3)
-                st.text_input("📌 彩券起始期號", value=str(latest_issue), key="import_issue")
-                st.number_input("🔁 連續期數", 1, 500, 1, key="import_draws")
-                st.number_input("💰 投注倍數", 1, 100, 1, key="import_multi")
+                with col_i1: st.text_input("📌 彩券起始期號", value=str(latest_issue), key="import_issue")
+                with col_i2: st.number_input("🔁 連續期數", 1, 500, 1, key="import_draws")
+                with col_i3: st.number_input("💰 投注倍數", 1, 100, 1, key="import_multi")
 
                 col_i4, col_i5 = st.columns([1, 4])
-                st.number_input("⭐ 玩法 (星數)", 1, 10, 5, key="import_star", on_change=on_import_star_change)
-                st.multiselect("✍️ 彩券上的號碼", range(1, 81), max_selections=st.session_state.get('import_star', 5), key="import_picks")
+                with col_i4: st.number_input("⭐ 玩法 (星數)", 1, 10, 5, key="import_star", on_change=on_import_star_change)
+                with col_i5: st.multiselect("✍️ 彩券上的號碼", range(1, 81), max_selections=st.session_state.get('import_star', 5), key="import_picks")
 
             st.button("📥 立即匯入這張彩券", type="primary", use_container_width=True, on_click=submit_import)
             
@@ -682,13 +725,15 @@ def main():
         
         # 📌 自動核對尚未開獎的注單
         for bet in st.session_state.bet_history:
-            if bet["status"] == "waiting":
+            # 期號大於目前最新期 → 一定還沒開獎，不必發請求查詢
+            if bet["status"] == "waiting" and int(bet["issue"]) <= latest_issue:
                 # 1. 先嘗試從目前已經載入的 3 天快取資料裡找
                 draw_result = next((item for item in history_data if item["issue"] == bet["issue"]), None)
                 
                 # 2. 如果快取裡找不到，代表這張單可能是很多天前的，呼叫時空引擎單抓 1 期
                 if not draw_result:
-                    res = BingoScraper.fetch_range(bet["issue"], 1, history_data)
+                    try: res = BingoScraper.fetch_range(bet["issue"], 1, history_data)
+                    except requests.exceptions.RequestException: res = []  # 連線失敗先維持等待，下次刷新再對
                     draw_result = res[0] if res else None
                     
                 if draw_result:
@@ -761,8 +806,9 @@ def main():
                         draw_result = next((item for item in history_data if item["issue"] == bet["issue"]), None)
                         
                         # 📌 同樣使用 fetch_range 取代舊函式，顯示開獎號碼球
-                        if not draw_result: 
-                            res = BingoScraper.fetch_range(bet["issue"], 1, history_data)
+                        if not draw_result:
+                            try: res = BingoScraper.fetch_range(bet["issue"], 1, history_data)
+                            except requests.exceptions.RequestException: res = []
                             draw_result = res[0] if res else None
                             
                         if draw_result: 
